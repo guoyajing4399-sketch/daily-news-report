@@ -1,29 +1,27 @@
-name Daily News Report
+name: Daily News Report
 
-on
-  schedule
-    # 每天北京时间 早上730 运行（UTC时间 2330）
-    # 注意：GitHub Actions 时间是 UTC，你需要往前推8小时
-    - cron '30 23   '
-  workflow_dispatch   # 允许手动触发（方便测试）
+on:
+  schedule:
+    # 每天北京时间 早上7:30 运行（UTC时间 23:30）
+    - cron: '30 23 * * *'
+  workflow_dispatch:   # 允许手动触发
 
-jobs
-  build
-    runs-on ubuntu-latest
-    steps
-      - name Checkout code
-        uses actionscheckout@v4
-      
-      - name Set up Python
-        uses actionssetup-python@v5
-        with
-          python-version '3.11'
-      
-      - name Install dependencies
-        run pip install feedparser
-      
-      - name Run daily report
-        env
-          # 将邮箱密码通过 GitHub Secrets 传入
-          EMAIL_PASSWORD ${{ secrets.EMAIL_PASSWORD }}
-        run python daily_report.py
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install feedparser
+
+      - name: Run daily report
+        env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python daily_report.py
