@@ -19,7 +19,7 @@ from typing import List, Dict
 SMTP_SERVER = "smtp.qq.com"      # QQ邮箱SMTP服务器，163邮箱用 smtp.163.com
 SMTP_PORT = 465                   # SSL端口
 SENDER_EMAIL = "380972017@qq.com"     # 你的邮箱地址
-SENDER_PASSWORD = "qiaxmcweqchnbhah"  # 第2步拿到的授权码
+SENDER_PASSWORD = os.environ.get('EMAIL_PASSWORD', '你的默认授权码(仅本地测试用)')  # 第2步拿到的授权码
 RECEIVER_EMAIL = "380972017@qq.com"     # 接收早报的邮箱（可以是同一个）
 
 # RSS 源列表（可以自己增删）
