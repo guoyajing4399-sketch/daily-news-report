@@ -19,9 +19,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install feedparser
+        run: pip install feedparser requests
 
       - name: Run daily report
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
         run: python daily_report.py

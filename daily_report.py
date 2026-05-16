@@ -13,6 +13,36 @@ from email.mime.text import MIMEText
 from email.header import Header
 from datetime import datetime
 from typing import List, Dict
+import requests
+
+# --- 配置区域 ---
+API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+MODEL_NAME = "deepseek-v4-flash"
+# ---------------
+
+def get_ai_summary(title, content):
+    if not API_KEY:
+        return "（未配置 DASHSCOPE_API_KEY，跳过摘要）"
+    # 只有获取到内容才请求AI
+    if not content or len(content) < 50: 
+        return "（内容过短或无详细内容，无法生成摘要）"
+    
+    # 构建提示词，要求AI为新闻标题写总结
+    prompt = f"""
+请为下面的新闻标题写一段中文摘要，要求简洁、客观、信息完整。控制在100字以内。
+标题：{title}
+新闻内容：{content}
+摘要：
+"""
+    # 调用阿里云百炼API
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": MODEL_NAME, "messages": [{"role": "user", "content": prompt}]}
+    try:
+        response = requests.post("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", headers=headers, json=payload, timeout=60)
+        return response.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"AI 摘要生成失败: {e}")
+        return "（摘要生成失败）"
 
 # ================== 配置区域（请修改成你自己的）==================
 # 邮箱配置
@@ -90,6 +120,41 @@ def fetch_news() -> Dict[str, List[Dict]]:
                 continue
     # 保存新发送的ID（实际会在发送后保存，这里先收集）
     return all_news, new_ids
+
+def get_watchlist(watchlist_file: str = "watchlist.txt"):
+    if os.path.exists(watchlist_file):
+        with open(watchlist_file, "r", encoding="utf-8") as f:
+            codes = [line.strip() for line in f if line.strip()]
+            if codes:
+                return codes
+    return ["000985", "516650", "517520", "513330"]
+
+def fetch_stock_quotes(stock_codes):
+    # 调用腾讯财经接口
+    results = {}
+    url = f"https://web.sqt.gtimg.cn/q={','.join(stock_codes)}"
+    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://gu.qq.com/'}
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.encoding = 'gbk'
+        data_lines = response.text.strip().split(';')
+        for line in data_lines:
+            if not line: continue
+            content = line.split('~')
+            if len(content) > 37:
+                symbol = content[2] # 股票代码
+                results[symbol] = {
+                    "name": content[1],
+                    "price": float(content[3]),
+                    "change_percent": float(content[32]) # 涨跌幅
+                }
+    except Exception as e:
+        print(f"获取行情失败: {e}")
+    return results
+
+# 在 generate_html 函数之前，调用并获取行情数据
+stock_data = fetch_stock_quotes(get_watchlist())
+
 
 def generate_html(news_dict: Dict[str, List[Dict]]) -> str:
     """生成漂亮的 HTML 邮件内容"""
