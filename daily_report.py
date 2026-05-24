@@ -10,7 +10,7 @@ import smtplib
 import hashlib
 import os
 import re
-from html import unescape
+from html import escape, unescape
 from email.mime.text import MIMEText
 from email.header import Header
 from collections import defaultdict
@@ -31,6 +31,8 @@ API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 MODEL_NAME = os.environ.get("DASHSCOPE_MODEL", "deepseek-v3")
 # 每条早报最多生成多少条 AI 摘要（避免 Actions 超时）
 MAX_AI_SUMMARIES = 50
+# 自选股行业分析（独立调用，不计入新闻摘要上限）
+ENABLE_STOCK_AI_ANALYSIS = os.environ.get("ENABLE_STOCK_AI_ANALYSIS", "1") != "0"
 # ---------------
 
 def strip_html(text: str) -> str:
@@ -50,6 +52,20 @@ def get_entry_content(entry) -> str:
     return ""
 
 
+def call_dashscope(prompt: str, timeout: int = 60) -> str:
+    """调用阿里云百炼 Chat Completions"""
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": MODEL_NAME, "messages": [{"role": "user", "content": prompt}]}
+    response = requests.post(
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"].strip()
+
+
 def get_ai_summary(title: str, content: str) -> str:
     if not API_KEY:
         return "（未配置 DASHSCOPE_API_KEY，跳过摘要）"
@@ -65,19 +81,8 @@ def get_ai_summary(title: str, content: str) -> str:
 
 标题：{title}
 摘要："""
-    # 调用阿里云百炼API
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": MODEL_NAME, "messages": [{"role": "user", "content": prompt}]}
     try:
-        response = requests.post(
-            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        return call_dashscope(prompt, timeout=60)
     except Exception as e:
         print(f"AI 摘要生成失败 [{title[:30]}...]: {e}")
         return "（摘要生成失败）"
@@ -238,31 +243,183 @@ def format_tencent_code(code: str) -> str:
     return f"sh{c}"
 
 
+def _tencent_field_float(fields: List[str], index: int) -> Optional[float]:
+    if index >= len(fields):
+        return None
+    raw = fields[index].strip()
+    if not raw or raw in ('-', '0', '0.00'):
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _infer_instrument_kind(symbol: str, name: str) -> str:
+    code = symbol.lower().replace("sh", "").replace("sz", "")
+    name_u = name.upper()
+    if "ETF" in name_u or "基金" in name or "LOF" in name_u:
+        return "ETF"
+    if code.startswith(("000", "399")) or "指数" in name or "综指" in name or "全指" in name:
+        return "指数"
+    if code.startswith(("51", "15", "16", "56", "58")):
+        return "ETF"
+    return "股票"
+
+
 def fetch_stock_quotes(stock_codes):
-    # 调用腾讯财经接口
+    """调用腾讯财经接口，附带估值等字段（ETF/指数部分字段可能为空）"""
     results = {}
     if not stock_codes:
         return results
     symbols = [format_tencent_code(c) for c in stock_codes]
     url = f"https://web.sqt.gtimg.cn/q={','.join(symbols)}"
-    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://gu.qq.com/'}
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        response.encoding = 'gbk'
-        data_lines = response.text.strip().split(';')
+        response.encoding = "gbk"
+        data_lines = response.text.strip().split(";")
         for line in data_lines:
-            if not line: continue
-            content = line.split('~')
-            if len(content) > 37:
-                symbol = content[2] # 股票代码
-                results[symbol] = {
-                    "name": content[1],
-                    "price": float(content[3]),
-                    "change_percent": float(content[32]) # 涨跌幅
-                }
+            if not line:
+                continue
+            eq = line.find('="')
+            if eq == -1:
+                continue
+            payload = line[eq + 2 :].strip('"')
+            fields = payload.split("~")
+            if len(fields) <= 32:
+                continue
+            symbol = fields[2]
+            results[symbol] = {
+                "name": fields[1],
+                "price": float(fields[3]),
+                "change_percent": float(fields[32]),
+                "pe": _tencent_field_float(fields, 39),
+                "pb": _tencent_field_float(fields, 46),
+                "turnover_rate": _tencent_field_float(fields, 38),
+                "market_cap_yi": _tencent_field_float(fields, 45),
+                "kind": _infer_instrument_kind(symbol, fields[1]),
+                "analysis": "",
+            }
     except Exception as e:
         print(f"获取行情失败: {e}")
     return results
+
+
+def _fmt_metric(value: Optional[float], suffix: str = "") -> str:
+    if value is None:
+        return "暂无"
+    return f"{value:.2f}{suffix}"
+
+
+def _build_stock_analysis_prompt(stock_data: Dict[str, dict]) -> str:
+    lines = []
+    for symbol, q in stock_data.items():
+        lines.append(
+            f"- {q['name']}（{symbol}，类型：{q.get('kind', '未知')}）"
+            f" 现价 {q['price']:.3f}，涨跌幅 {q['change_percent']:+.2f}%"
+            f"，市盈率 {_fmt_metric(q.get('pe'))}，市净率 {_fmt_metric(q.get('pb'))}"
+            f"，换手率 {_fmt_metric(q.get('turnover_rate'), '%')}"
+            f"，总市值 {_fmt_metric(q.get('market_cap_yi'), ' 亿元')}"
+        )
+    today = now_beijing().strftime("%Y-%m-%d")
+    symbols_hint = "、".join(stock_data.keys())
+    return f"""你是资深的 A 股与 ETF 行业研究分析师。请根据以下自选股今日行情（数据日期：{today}），对每只标的的**所属行业或跟踪板块**做研究性分析。
+
+【行情数据】
+{chr(10).join(lines)}
+
+【输出格式】（必须覆盖全部标的：{symbols_hint}）
+对每一只标的单独输出一个区块，标题行格式固定为：
+### 【股票代码】标的名称
+
+区块内须包含且仅包含以下四行（每行以加粗标签开头）：
+**行业/板块：**
+**估值水平：**
+**走势展望：**
+**主要风险：**
+
+要求：
+1. 股票按所属申万/中信一级行业分析；ETF、指数请分析其跟踪指数或重仓行业，勿当成单一公司。
+2. 结合市盈率、市净率或同类板块做估值判断；字段为「暂无」时做定性说明并注明数据缺失。
+3. 走势展望写短期至中期，语气客观中性；风险列 2～4 条要点。
+4. 单区块总字数 120～180 字；全文勿荐股、勿保证收益。"""
+
+
+def _normalize_symbol_code(code: str) -> str:
+    c = code.strip().lower()
+    if c.startswith(("sh", "sz", "bj", "hk")):
+        return c[2:]
+    return c
+
+
+def _parse_stock_analysis_blocks(text: str, stock_data: Dict[str, dict]) -> None:
+    """将模型输出按 ### 【代码】 拆分到各标的 analysis 字段"""
+    pattern = re.compile(
+        r"###\s*【?([a-zA-Z0-9]+)】?\s*[^\n]*\n(.*?)(?=\n###\s*|\Z)",
+        re.DOTALL,
+    )
+    symbol_map = {_normalize_symbol_code(s): s for s in stock_data}
+    matched = set()
+    for code, body in pattern.findall(text):
+        key = symbol_map.get(_normalize_symbol_code(code))
+        if key:
+            stock_data[key]["analysis"] = body.strip()
+            matched.add(key)
+    if matched:
+        return
+    # 解析失败：整段作为共用分析
+    fallback = text.strip() or "（未能解析行业分析结构）"
+    for symbol in stock_data:
+        stock_data[symbol]["analysis"] = fallback
+
+
+def enrich_stocks_with_analysis(stock_data: Dict[str, dict]) -> None:
+    """为自选股生成行业/估值/展望/风险分析（原地修改）"""
+    if not stock_data:
+        return
+    if not ENABLE_STOCK_AI_ANALYSIS:
+        for q in stock_data.values():
+            q["analysis"] = "（已关闭自选股 AI 分析）"
+        return
+    if not API_KEY:
+        for q in stock_data.values():
+            q["analysis"] = "（未配置 DASHSCOPE_API_KEY，暂无行业分析）"
+        return
+
+    print("生成自选股行业分析...")
+    try:
+        raw = call_dashscope(_build_stock_analysis_prompt(stock_data), timeout=120)
+        _parse_stock_analysis_blocks(raw, stock_data)
+    except Exception as e:
+        print(f"自选股行业分析失败: {e}")
+        msg = "（行业分析生成失败，请稍后重试）"
+        for q in stock_data.values():
+            q["analysis"] = msg
+
+    for symbol, q in stock_data.items():
+        if not q.get("analysis"):
+            q["analysis"] = "（未生成该标的的分析内容）"
+
+
+def _analysis_to_html(text: str) -> str:
+    """将分析文本转为安全 HTML"""
+    parts = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"\*\*(.+?)\*\*:?\s*(.*)", line)
+        if m:
+            label, rest = m.group(1), m.group(2)
+            rest_html = escape(rest) if rest else ""
+            parts.append(
+                f"<div class='stock-analysis-line'><strong>{escape(label)}</strong>"
+                f"{(': ' + rest_html) if rest_html else ''}</div>"
+            )
+        else:
+            parts.append(f"<div class='stock-analysis-line'>{escape(line)}</div>")
+    return "".join(parts) if parts else escape(text)
 
 def enrich_news_with_summaries(news_dict: Dict[str, List[Dict]]) -> None:
     """为新闻条目生成 AI 摘要（原地修改）"""
@@ -281,21 +438,36 @@ def render_stock_section(stock_data: Dict[str, dict]) -> str:
     if not stock_data:
         return "<p>（未能获取自选股行情，请检查 watchlist.txt 或网络）</p>"
     rows = ""
+    cards = ""
     for symbol, q in stock_data.items():
         pct = q["change_percent"]
         color = "#e74c3c" if pct > 0 else "#27ae60" if pct < 0 else "#7f8c8d"
         sign = "+" if pct > 0 else ""
+        pe = _fmt_metric(q.get("pe"))
+        pb = _fmt_metric(q.get("pb"))
+        kind = escape(q.get("kind", ""))
         rows += f"""
         <tr>
-            <td>{q['name']} ({symbol})</td>
+            <td>{escape(q['name'])} ({symbol})<br><span class="stock-kind">{kind}</span></td>
             <td style="text-align:right">{q['price']:.3f}</td>
             <td style="text-align:right;color:{color}">{sign}{pct:.2f}%</td>
+            <td style="text-align:right">{pe}</td>
+            <td style="text-align:right">{pb}</td>
         </tr>"""
+        analysis_html = _analysis_to_html(q.get("analysis", ""))
+        cards += f"""
+        <div class="stock-card">
+            <div class="stock-card-title">{escape(q['name'])} ({symbol})</div>
+            <div class="stock-card-analysis">{analysis_html}</div>
+        </div>"""
     return f"""
     <table class="stock-table">
-        <thead><tr><th>名称</th><th>现价</th><th>涨跌幅</th></tr></thead>
+        <thead><tr><th>名称</th><th>现价</th><th>涨跌幅</th><th>市盈率</th><th>市净率</th></tr></thead>
         <tbody>{rows}</tbody>
-    </table>"""
+    </table>
+    <p class="stock-disclaimer">以下行业分析由 AI 根据公开行情与常识生成，仅供参考，不构成投资建议。</p>
+    <h3 class="stock-subtitle">行业与估值分析</h3>
+    {cards}"""
 
 
 def generate_html(news_dict: Dict[str, List[Dict]], stock_data: Dict[str, dict]) -> str:
@@ -312,6 +484,13 @@ def generate_html(news_dict: Dict[str, List[Dict]], stock_data: Dict[str, dict])
             .stock-table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
             .stock-table th, .stock-table td {{ padding: 8px 12px; border-bottom: 1px solid #eee; }}
             .stock-table th {{ background: #f8f9fa; text-align: left; color: #555; }}
+            .stock-kind {{ font-size: 11px; color: #95a5a6; }}
+            .stock-subtitle {{ font-size: 15px; color: #34495e; margin: 18px 0 8px; }}
+            .stock-disclaimer {{ font-size: 12px; color: #95a5a6; margin: 12px 0 0; }}
+            .stock-card {{ margin: 12px 0; padding: 12px 14px; background: #f8fafc; border-left: 4px solid #3498db; border-radius: 4px; }}
+            .stock-card-title {{ font-weight: bold; color: #2c3e50; margin-bottom: 8px; }}
+            .stock-card-analysis {{ font-size: 13px; color: #34495e; line-height: 1.55; }}
+            .stock-analysis-line {{ margin: 4px 0; }}
             .news-item {{ margin: 15px 0; padding: 10px; background: #fafafa; border-radius: 5px; }}
             .news-title {{ font-size: 16px; font-weight: bold; }}
             .news-title a {{ color: #2980b9; text-decoration: none; }}
@@ -324,7 +503,7 @@ def generate_html(news_dict: Dict[str, List[Dict]], stock_data: Dict[str, dict])
     <body>
     <div class="container">
         <h1>📰 每日资讯早报 - {today}</h1>
-        <h2>📈 自选股行情</h2>
+        <h2>📈 自选股行情与行业分析</h2>
         {render_stock_section(stock_data)}
     """
     total_count = 0
@@ -404,6 +583,7 @@ def main():
     print("获取自选股行情...")
     stock_data = fetch_stock_quotes(get_watchlist())
     print(f"行情数据: {len(stock_data)} 只")
+    enrich_stocks_with_analysis(stock_data)
 
     print("生成 AI 摘要...")
     enrich_news_with_summaries(news_dict)
