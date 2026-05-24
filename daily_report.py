@@ -13,15 +13,24 @@ import re
 from html import unescape
 from email.mime.text import MIMEText
 from email.header import Header
-from datetime import datetime
-from typing import List, Dict, Tuple
+from collections import defaultdict
+from datetime import date, datetime, timezone
+from typing import List, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
 import requests
+
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def now_beijing() -> datetime:
+    """当前北京时间（邮件标题、日期展示统一使用）"""
+    return datetime.now(BEIJING_TZ)
 
 # --- 配置区域 ---
 API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 MODEL_NAME = os.environ.get("DASHSCOPE_MODEL", "deepseek-v3")
 # 每条早报最多生成多少条 AI 摘要（避免 Actions 超时）
-MAX_AI_SUMMARIES = 15
+MAX_AI_SUMMARIES = 50
 # ---------------
 
 def strip_html(text: str) -> str:
@@ -84,31 +93,62 @@ RECEIVER_EMAIL = "380972017@qq.com"     # 接收早报的邮箱（可以是同�
 # RSS 源列表（可以自己增删）
 RSS_SOURCES = {
     "AI/科技": [
-        "https://news.ycombinator.com/rss",                      # Hacker News
+        "https://blog.google/technology/ai/rss/",                      # Hacker News
         "https://openai.com/news/rss.xml",                       # OpenAI
         "https://ai.meta.com/blog/feed/",                        # Meta AI
         "https://machinelearning.apple.com/rss/",                # Apple ML
         "https://feeds.reuters.com/reuters/technologyNews",      # 路透科技
+        "https://www.microsoft.com/en-us/research/feed/",        #微博研究院博客
+        "https://blogs.nvidia.com/feed/",                         #英伟达博客   
+        "https://www.anthropic.com/news/feed.xml",                #Anthropic博客
     ],
     "金融财经": [
         "https://feeds.reuters.com/reuters/businessNews",        # 路透商业
         "https://www.bloomberg.com/feed/podcast/technology.xml", # 彭博科技
+        "https://feeds.a.dj.com/rss/RSSWSJBusiness.xml",         # 华尔街日报商业
+        "https://www.ft.com/?format=rss",                        # 金融时报
     ],
     "国际军事": [
         "http://www.people.com.cn/rss/military.xml",              # 人民网军事
         "http://www.people.com.cn/rss/world.xml",                 # 人民网国际
         "https://www.aljazeera.com/xml/rss/all.xml",             # 半岛电视台
+        "http://feeds.bbci.co.uk/news/world/rss.xml",            # 英国广播公司世界新闻
+        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", # 纽约时报世界新闻
+        "https://www.theguardian.com/world/rss",                   # 卫报世界新闻
+        "https://www.defensenews.com/arc/outboundfeeds/rss/",      # 国防新闻
     ]
 }
 
 # 每天最多保留多少条新闻（防止邮件太长）
-MAX_ITEMS_PER_SOURCE = 8
+MAX_ITEMS_PER_SOURCE = 10
 # ================================================================
 
 def get_article_id(entry) -> str:
-    """生成文章唯一ID，用于去重"""
-    unique_str = entry.get('link', '') + entry.get('title', '')
-    return hashlib.md5(unique_str.encode('utf-8')).hexdigest()
+    """生成文章唯一ID，用于去重（链接 + 标题）"""
+    unique_str = entry.get("link", "") + entry.get("title", "")
+    return hashlib.md5(unique_str.encode("utf-8")).hexdigest()
+
+
+def get_entry_beijing_date(entry) -> Optional[date]:
+    """解析 RSS 条目发布时间，转为北京时间日期"""
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not parsed:
+        return None
+    try:
+        dt_utc = datetime(*parsed[:6], tzinfo=timezone.utc)
+        return dt_utc.astimezone(BEIJING_TZ).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def is_entry_today(entry, today: Optional[date] = None) -> bool:
+    """是否为北京时间当日的文章"""
+    entry_date = get_entry_beijing_date(entry)
+    if entry_date is None:
+        return False
+    if today is None:
+        today = now_beijing().date()
+    return entry_date == today
 
 def load_sent_ids(state_file: str = "sent_ids.txt") -> set:
     """加载历史已发送的文章ID"""
@@ -123,31 +163,56 @@ def save_sent_ids(sent_ids: set, state_file: str = "sent_ids.txt"):
         for aid in sent_ids:
             f.write(aid + '\n')
 
-def fetch_news() -> Tuple[Dict[str, List[Dict]], set]:
-    """从所有 RSS 源抓取新闻"""
-    all_news = {}
-    sent_ids = load_sent_ids()
-    new_ids = set()
+def fetch_news(ignore_sent: bool = False) -> Tuple[Dict[str, List[Dict]], set]:
+    """从所有 RSS 源抓取新闻：仅当日（北京时间）、跨源去重、跳过历史已推送"""
+    all_news = {category: [] for category in RSS_SOURCES}
+    sent_ids = set() if ignore_sent else load_sent_ids()
+    seen_ids: set = set()  # 本次采集跨分类、跨源去重
+    new_ids: set = set()
+    today = now_beijing().date()
+    stats = defaultdict(int)
 
     for category, feeds in RSS_SOURCES.items():
-        all_news[category] = []
         for feed_url in feeds:
             try:
                 feed = feedparser.parse(feed_url)
-                for entry in feed.entries[:MAX_ITEMS_PER_SOURCE]:
+                per_source_count = 0
+                for entry in feed.entries:
+                    if per_source_count >= MAX_ITEMS_PER_SOURCE:
+                        break
+                    if not is_entry_today(entry, today):
+                        stats["not_today"] += 1
+                        continue
                     article_id = get_article_id(entry)
-                    if article_id in sent_ids:
-                        continue  # 已经发过了，跳过
+                    if article_id in seen_ids:
+                        stats["duplicate"] += 1
+                        continue
+                    if not ignore_sent and article_id in sent_ids:
+                        stats["already_sent"] += 1
+                        continue
+                    seen_ids.add(article_id)
                     new_ids.add(article_id)
+                    per_source_count += 1
+                    entry_date = get_entry_beijing_date(entry)
+                    published_display = entry.get("published") or (
+                        entry_date.strftime("%Y-%m-%d") if entry_date else "日期未知"
+                    )
                     all_news[category].append({
                         "title": entry.get("title", "无标题"),
                         "link": entry.get("link", "#"),
-                        "published": entry.get("published", "日期未知"),
+                        "published": published_display,
                         "content": get_entry_content(entry),
                     })
             except Exception as e:
                 print(f"读取RSS失败 {feed_url}: {e}")
                 continue
+
+    print(
+        f"过滤统计（北京时间 {today}）："
+        f" 非当日 {stats['not_today']} 条，"
+        f"历史已推送 {stats['already_sent']} 条，"
+        f"跨源重复 {stats['duplicate']} 条"
+    )
     return all_news, new_ids
 
 def get_watchlist(watchlist_file: str = "watchlist.txt"):
@@ -235,7 +300,7 @@ def render_stock_section(stock_data: Dict[str, dict]) -> str:
 
 def generate_html(news_dict: Dict[str, List[Dict]], stock_data: Dict[str, dict]) -> str:
     """生成漂亮的 HTML 邮件内容"""
-    today = datetime.now().strftime("%Y年%m月%d日")
+    today = now_beijing().strftime("%Y年%m月%d日")
     html = f"""
     <html>
     <head>
@@ -281,10 +346,10 @@ def generate_html(news_dict: Dict[str, List[Dict]], stock_data: Dict[str, dict])
             </div>
             """
     if total_count == 0:
-        html += "<p>今天没有找到新的新闻，请检查RSS源或稍后再试。</p>"
+        html += "<p>今天（北京时间）暂无新的待推送新闻，可能已全部发送或 RSS 尚无当日更新。</p>"
     html += f"""
         <div class="footer">
-            此邮件由您的AI早报系统自动生成 | 数据采集时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            此邮件由您的AI早报系统自动生成 | 数据采集时间: {now_beijing().strftime('%Y-%m-%d %H:%M:%S')} (北京时间)
         </div>
     </div>
     </body>
@@ -294,7 +359,7 @@ def generate_html(news_dict: Dict[str, List[Dict]], stock_data: Dict[str, dict])
 
 def send_email(html_content: str):
     """发送邮件"""
-    subject = f"每日早报 - {datetime.now().strftime('%Y-%m-%d')}"
+    subject = f"每日早报 - {now_beijing().strftime('%Y-%m-%d')}"
     msg = MIMEText(html_content, 'html', 'utf-8')
     msg['Subject'] = Header(subject, 'utf-8')
     msg['From'] = SENDER_EMAIL
@@ -309,12 +374,32 @@ def send_email(html_content: str):
         print(f"邮件发送失败: {e}")
 
 def main():
+    import argparse
+    import sys
+
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+    parser = argparse.ArgumentParser(description="每日资讯早报")
+    parser.add_argument(
+        "--resend",
+        action="store_true",
+        help="忽略已发送记录，重新生成并推送（不更新 sent_ids.txt）",
+    )
+    args = parser.parse_args()
+
+    if args.resend:
+        print("重新推送模式：忽略 sent_ids 去重")
+
     print("开始采集新闻...")
-    news_dict, new_ids = fetch_news()
+    news_dict, new_ids = fetch_news(ignore_sent=args.resend)
     if not news_dict or not any(news_dict.values()):
-        print("没有新新闻，今日不发送邮件。")
+        print("没有符合条件的当日新新闻，今日不发送邮件。")
         return
-    print(f"采集到新文章: {sum(len(v) for v in news_dict.values())} 条")
+    print(f"采集到文章: {sum(len(v) for v in news_dict.values())} 条")
 
     print("获取自选股行情...")
     stock_data = fetch_stock_quotes(get_watchlist())
@@ -325,11 +410,12 @@ def main():
 
     html_content = generate_html(news_dict, stock_data)
     send_email(html_content)
-    # 保存已发送ID
-    old_ids = load_sent_ids()
-    all_ids = old_ids.union(new_ids)
-    save_sent_ids(all_ids)
-    print("完成！")
+    if args.resend:
+        print("重新推送完成（未更新 sent_ids.txt）")
+    else:
+        old_ids = load_sent_ids()
+        save_sent_ids(old_ids.union(new_ids))
+        print("完成！")
 
 if __name__ == "__main__":
     main()

@@ -2,9 +2,15 @@ name: Daily News Report
 
 on:
   schedule:
-    # 每天北京时间 早上7:30 运行（UTC时间 23:30）
-    - cron: '30 23 * * *'
-  workflow_dispatch:   # 允许手动触发
+    # 每天北京时间 07:30 运行
+    - cron: '30 7 * * *'
+      timezone: Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      resend:
+        description: 重新推送（忽略 sent_ids 去重，不更新去重文件）
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -21,8 +27,14 @@ jobs:
       - name: Install dependencies
         run: pip install feedparser requests
 
+      - name: Restore sent article ids
+        uses: actions/cache@v4
+        with:
+          path: sent_ids.txt
+          key: daily-report-sent-ids-${{ github.repository }}
+
       - name: Run daily report
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-        run: python daily_report.py
+        run: python daily_report.py ${{ github.event_name == 'workflow_dispatch' && inputs.resend && '--resend' || '' }}
