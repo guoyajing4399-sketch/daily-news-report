@@ -1,10 +1,10 @@
 name: Daily News Report
 
 on:
-  schedule:
-    # 每天北京时间 07:30 运行
-    - cron: '30 7 * * *'
-      timezone: Asia/Shanghai
+  # 定时任务已暂停；需要发送时在 Actions 页手动 Run workflow
+  # schedule:
+  #   - cron: '30 7 * * *'
+  #     timezone: Asia/Shanghai
   workflow_dispatch:
     inputs:
       resend:
